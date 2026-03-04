@@ -28,7 +28,6 @@ from model_utils import (
 import shutil
 import logging
 
-# from diffusers import StableDiffusionPipeline
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers import logging as transformers_logging
 transformers_logging.set_verbosity_error()  # disable warning
@@ -122,9 +121,9 @@ def get_parser(**parser_kwargs):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)  # for multi-GPU.
-    np.random.seed(args.seed)  # Numpy module.
-    random.seed(args.seed)  # Python random module.
+        torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     return args
 
@@ -142,7 +141,7 @@ def main():
     #################################################################################
     args = get_parser()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dtype = torch.float32 # use float32 by default
+    dtype = torch.float32
     image_name = args.prompt.replace(' ', '_')
     shutil.copyfile(__file__, join(args.work_dir, os.path.basename(__file__)))
     ### set up logger
@@ -168,14 +167,10 @@ def main():
     #                         load model & diffusion scheduler                      #
     #################################################################################
     logger.info(f'load models from path: {args.model_path}')
-    # 1. Load the autoencoder model which will be used to decode the latents into image space. 
     vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae", torch_dtype=dtype)
-    # 2. Load the tokenizer and text encoder to tokenize and encode the text. 
     tokenizer = CLIPTokenizer.from_pretrained(args.model_path, subfolder="tokenizer", torch_dtype=dtype)
     text_encoder = CLIPTextModel.from_pretrained(args.model_path, subfolder="text_encoder", torch_dtype=dtype)
-    # 3. The UNet model for generating the latents.
     unet = UNet2DConditionModel.from_pretrained(args.model_path, subfolder="unet", torch_dtype=dtype)
-    # 4. Scheduler
     scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler", torch_dtype=dtype)
 
     if args.half_inference:
@@ -195,23 +190,44 @@ def main():
     
     if args.generation_mode == 'vsd':
         if args.phi_model == 'lora':
+            ######################################################################
+            # PATCHED: Use PEFT-based LoRA injection instead of old attention
+            # processor approach.
+            #
+            # OLD:
+            #   unet_phi, unet_lora_layers = extract_lora_diffusers(unet, device)
+            #   phi_params = list(unet_lora_layers.parameters())
+            #   # unet_phi was the same object as unet, modified in-place
+            #
+            # NEW:
+            #   extract_lora_diffusers wraps unet with PEFT LoRA and returns
+            #   (wrapped_unet, list_of_lora_params).
+            #   unet_phi IS unet (same object, LoRA enabled).
+            #   To run pretrained inference: unet.disable_adapter_layers()
+            #   To run LoRA inference: unet.enable_adapter_layers()
+            ######################################################################
             if args.lora_vprediction:
                 assert args.model_path == 'stabilityai/stable-diffusion-2-1-base'
                 vae_phi = AutoencoderKL.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder="vae", torch_dtype=dtype).to(device)
                 unet_phi = UNet2DConditionModel.from_pretrained('stabilityai/stable-diffusion-2-1', subfolder="unet", torch_dtype=dtype).to(device)
                 vae_phi.requires_grad_(False)
-                unet_phi, unet_lora_layers = extract_lora_diffusers(unet_phi, device)
+                unet_phi, phi_params = extract_lora_diffusers(unet_phi, device)
             else:
                 vae_phi = vae
-                ### unet_phi is the same instance as unet that has been modified in-place
-                unet_phi, unet_lora_layers = extract_lora_diffusers(unet, device)
-            phi_params = list(unet_lora_layers.parameters())
+                # unet gets wrapped with PEFT LoRA in-place
+                unet, phi_params = extract_lora_diffusers(unet, device)
+                unet_phi = unet  # same object — LoRA on/off controlled via enable/disable
+
             if args.load_phi_model_path:
-                unet_phi.load_attn_procs(args.load_phi_model_path)
+                ####################################################################
+                # PATCHED: Load PEFT LoRA weights instead of attn_procs
+                # OLD: unet_phi.load_attn_procs(args.load_phi_model_path)
+                ####################################################################
+                from peft import PeftModel
+                unet_phi = PeftModel.from_pretrained(unet_phi, args.load_phi_model_path)
                 unet_phi = unet_phi.to(device)
+
         elif args.phi_model == 'unet_simple':
-            # initialize simple unet, same input/output as (pre-trained) unet
-            ### IMPORTANT: need the proper (wide) channel numbers
             channels = 4 if args.rgb_as_latents else 3
             unet_phi = UNet2DConditionModel(
                                         sample_size=64,
@@ -250,7 +266,6 @@ def main():
     #################################################################################
     #                       initialize particles and text emb                       #
     #################################################################################
-    ### get text embedding
     text_input = tokenizer([args.prompt] * max(args.particle_num_vsd,args.particle_num_phi), padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
     with torch.no_grad():
         text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
@@ -264,7 +279,6 @@ def main():
     text_embeddings_phi = torch.cat([uncond_embeddings[:args.particle_num_phi], text_embeddings[:args.particle_num_phi]])
     ### init particles
     if args.use_mlp_particle:
-        # use siren network
         from model_utils import Siren
         args.lr = 1e-4
         print(f'for mlp_particle, set lr to {args.lr}')
@@ -272,9 +286,8 @@ def main():
         particles = nn.ModuleList([Siren(2, hidden_features=256, hidden_layers=3, out_features=out_features, device=device) for _ in range(args.batch_size)])
     else:
         if args.init_img_path:
-            # load image
             init_image = io.read_image(args.init_img_path).unsqueeze(0) / 255
-            init_image = init_image * 2 - 1   #[-1,1]
+            init_image = init_image * 2 - 1
             if args.rgb_as_latents:
                 particles = vae.config.scaling_factor * vae.encode(init_image.to(device)).latent_dist.sample()
             else:
@@ -283,15 +296,10 @@ def main():
             if args.rgb_as_latents:
                 particles = torch.randn((args.batch_size, unet.config.in_channels, args.height // 8, args.width // 8))
             else:
-                # gaussian in rgb space --> strange artifacts
                 particles = torch.randn((args.batch_size, 3, args.height, args.width))
-                args.lr = args.lr * 1   # need larger lr for rgb particles
-                # ## gaussian in latent space --> not better
-                # particles = torch.randn((args.batch_size, unet.in_channels, args.height // 8, args.width // 8)).to(device, dtype=dtype)
-                # particles = vae.decode(particles).sample
+                args.lr = args.lr * 1
     particles = particles.to(device, dtype=dtype)
     if args.nerf_init and args.rgb_as_latents and not args.use_mlp_particle:
-        # current only support sds and experimental for only rgb_as_latents==True
         assert args.generation_mode == 'sds'
         with torch.no_grad():
             noise_pred = predict_noise0_diffuser(unet, particles, text_embeddings_vsd, t=999, guidance_scale=7.5, scheduler=scheduler)
@@ -300,14 +308,10 @@ def main():
     #################################################################################
     #                           optimizer & lr schedule                             #
     #################################################################################
-    ### weight loss
     loss_weights = get_loss_weights(scheduler.betas, args)
-    ### optimizer
     if args.use_mlp_particle:
-        # For a list of models, we want to optimize their parameters
         particles_to_optimize = [param for mlp in particles for param in mlp.parameters() if param.requires_grad]
     else:
-        # For a tensor, we can optimize the tensor directly
         particles.requires_grad = True
         particles_to_optimize = [particles]
 
@@ -316,10 +320,13 @@ def main():
     ### Initialize optimizer & scheduler
     if args.generation_mode == 'vsd':
         if args.phi_model in ['lora', 'unet_simple']:
+            ######################################################################
+            # PATCHED: phi_params is now a plain list of parameters from PEFT,
+            # not from AttnProcsLayers. Usage is identical.
+            ######################################################################
             phi_optimizer = torch.optim.AdamW([{"params": phi_params, "lr": args.phi_lr}], lr=args.phi_lr)
             print(f'number of trainable parameters of phi model in optimizer: {sum(p.numel() for p in phi_params if p.requires_grad)}')
     optimizer = get_optimizer(particles_to_optimize, args)
-    ### lr_scheduler
     if args.use_scheduler:
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, \
             start_factor=args.lr_scheduler_start_factor, total_iters=args.lr_scheduler_iters)
@@ -336,47 +343,35 @@ def main():
         image_progress = []
     first_iteration = True
     logger.info("################# Metrics: ####################")
-    ######## t schedule #########
     chosen_ts = get_t_schedule(num_train_timesteps, args, loss_weights)
     pbar = tqdm(chosen_ts)
+
     #################################################################################
     #                                     MODE: T2I                                 #
     #################################################################################
-    ### regular sd text to image generation
     if args.generation_mode == 't2i':
-        if args.phi_model == 'lora' and args.load_phi_model_path:
-            ### unet_phi is the same instance as unet that has been modified in-place
-            unet_phi, unet_lora_layers = extract_lora_diffusers(unet, device)
-            phi_params = list(unet_lora_layers.parameters())
-            unet_phi.load_attn_procs(args.load_phi_model_path)
-            unet = unet_phi.to(device)
+        ######################################################################
+        # PATCHED: Removed old LoRA loading for t2i mode.
+        # If you need t2i with a saved LoRA, load it via PEFT instead.
+        ######################################################################
         step = 0
-        # get latent of all particles
         assert args.use_mlp_particle == False
         latents = get_latents(particles, vae, args.rgb_as_latents)
         if args.half_inference:
             latents = latents.half()
             text_embeddings_vsd = text_embeddings_vsd.half()
         for t in tqdm(scheduler.timesteps):
-            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = scheduler.scale_model_input(latent_model_input, t)
             latent_noisy = latents
-            # predict the noise residual
             with torch.no_grad():
                 noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings_vsd).sample
-            # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            # compute the previous noisy sample x_t -> x_t-1
             latents = scheduler.step(noise_pred, t, latents).prev_sample
-            ######## Evaluation and log metric #########
             if args.log_steps and (step % args.log_steps == 0 or step == (args.num_steps-1)):
-                # save current img_tensor
-                # scale and decode the image latents with vae
                 tmp_latents = 1 / vae.config.scaling_factor * latents.clone().detach()
                 if args.save_x0:
-                    # compute the predicted clean sample x_0
                     pred_latents = scheduler.step(noise_pred, t, latent_noisy).pred_original_sample.to(dtype).clone().detach()
                 with torch.no_grad():
                     if args.half_inference:
@@ -396,24 +391,21 @@ def main():
     #################################################################################
     #                                 MODE: SDS | VSD                               #
     #################################################################################
-    ### sds text to image generation
     elif args.generation_mode in ['sds', 'vsd']:
-        cross_attention_kwargs = {'scale': args.lora_scale} if (args.generation_mode == 'vsd' and args.phi_model == 'lora') else {}
+        ######################################################################
+        # PATCHED: Removed cross_attention_kwargs for LoRA scale control.
+        # With PEFT, LoRA is toggled via enable/disable_adapter_layers()
+        # inside sds_vsd_grad_diffuser, not via cross_attention_kwargs.
+        ######################################################################
+        cross_attention_kwargs = {}
         for step, chosen_t in enumerate(pbar):
-            # get latent of all particles
             latents = get_latents(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle)
             t = torch.tensor([chosen_t]).to(device)
-            ######## q sample #########
-            # random sample particle_num_vsd particles from latents
             indices = torch.randperm(latents.size(0))
             latents_vsd = latents[indices[:args.particle_num_vsd]]
             noise = torch.randn_like(latents_vsd)
             noisy_latents = scheduler.add_noise(latents_vsd, noise, t)
-            ######## Do the gradient for latents!!! #########
             optimizer.zero_grad()
-            # predict x0 use ddim sampling
-            # z0_latents = predict_x0_diffuser(unet, scheduler, noisy_latents, text_embeddings, t, guidance_scale=args.guidance_scale)
-            # loss step
             grad_, noise_pred, noise_pred_phi = sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings_vsd, t, \
                                                     guidance_scale=args.guidance_scale, unet_phi=unet_phi, \
                                                         generation_mode=args.generation_mode, phi_model=args.phi_model, \
@@ -421,13 +413,8 @@ def main():
                                                                 multisteps=args.multisteps, scheduler=scheduler, lora_v=args.lora_vprediction, \
                                                                     half_inference=args.half_inference, \
                                                                         cfg_phi=args.cfg_phi, grad_scale=args.grad_scale)
-            ## weighting
             grad_ *= loss_weights[int(t)]
-            # ref: https://github.com/threestudio-project/threestudio/blob/5e29759db7762ec86f503f97fe1f71a9153ce5d9/threestudio/models/guidance/stable_diffusion_guidance.py#L427
-            # construct loss
-            # loss = loss_weights[int(t)] * F.mse_loss(noise_pred, noise, reduction="mean") / args.batch_size
             target = (latents_vsd - grad_).detach()
-            # d(loss)/d(latents) = latents - target = latents - (latents - grad) = grad
             loss = 0.5 * F.mse_loss(latents_vsd, target, reduction="mean") / args.batch_size
             loss.backward()
             optimizer.step()
@@ -437,17 +424,13 @@ def main():
             torch.cuda.empty_cache()
             ######## Do the gradient for unet_phi!!! #########
             if args.generation_mode == 'vsd':
-                ## update the unet (phi) model 
                 for _ in range(args.phi_update_step):
                     phi_optimizer.zero_grad()
                     if args.use_t_phi:
-                        # different t for phi finetuning
-                        # t_phi = np.random.choice(chosen_ts, 1, replace=True)[0]
                         t_phi = np.random.choice(list(range(num_train_timesteps)), 1, replace=True)[0]
                         t_phi = torch.tensor([t_phi]).to(device)
                     else:
                         t_phi = t
-                    # random sample particle_num_phi particles from latents
                     indices = torch.randperm(latents.size(0))
                     latents_phi = latents[indices[:args.particle_num_phi]]
                     noise_phi = torch.randn_like(latents_phi)
@@ -458,21 +441,14 @@ def main():
                     loss_phi.backward()
                     phi_optimizer.step()
 
-            ### Store loss and step
             train_loss_values.append(loss.item())
-            ### update pbar
             pbar.set_description(f'Loss: {loss.item():.6f}, sampled t : {t.item()}')
 
             optimizer.zero_grad()
-            ######## Evaluation and log metric #########
             if args.log_steps and (step % args.log_steps == 0 or step == (args.num_steps-1)):
                 log_steps.append(step)
-                # save current img_tensor
-                # scale and decode the image latents with vae
                 tmp_latents = 1 / vae.config.scaling_factor * latents_vsd.clone().detach()
                 if args.save_x0:
-                    # compute the predicted clean sample x_0
-                    # pred_latents = scheduler.step(noise_pred, t, noisy_latents).pred_original_sample.to(dtype).clone().detach()
                     pred_latents = scheduler.step(noise_pred-noise_pred_phi+noise, t, noisy_latents).pred_original_sample.to(dtype).clone().detach()
                     if args.generation_mode == 'vsd':
                         pred_latents_phi = scheduler.step(noise_pred_phi, t, noisy_latents).pred_original_sample.to(dtype).clone().detach()
@@ -501,7 +477,6 @@ def main():
                 logger.info(f'step: {step}; average loss: {ave_train_loss_value}')
                 update_curve(train_loss_values, 'Train_loss', 'steps', 'Loss', args.work_dir, args.run_id)
                 update_curve(ave_train_loss_values, 'Ave_Train_loss', 'steps', 'Loss', args.work_dir, args.run_id, log_steps=log_steps[1:])
-                # calculate psnr value and update curve
             if first_iteration and device==torch.device('cuda'):
                 global_free, total_gpu = torch.cuda.mem_get_info(0)
                 logger.info(f'global free and total GPU memory: {round(global_free/1024**3,6)} GB, {round(total_gpu/1024**3,6)} GB')
@@ -512,7 +487,6 @@ def main():
     #                                   save results                                #
     #################################################################################
     if args.log_gif:
-        # make gif
         images = sorted(Path(args.work_dir).glob(f"*{image_name}*.png"))
         images = [imageio.imread(image) for image in images]
         imageio.mimsave(f'{args.work_dir}/{image_name}.gif', images, duration=0.3)
@@ -525,19 +499,22 @@ def main():
     else:
         image = get_images(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle)
     save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/final_image_{image_name}.png')
-    # through vae will get image with less artifacts for image particles
-    # from model_utils import batch_decode_vae
-    # images = batch_decode_vae(latents, vae)
-    # save_image((images/2+0.5).clamp(0, 1), f'{args.work_dir}/final_image_2_{image_name}.png')
 
     if args.generation_mode in ['vsd'] and args.save_phi_model:
+        ######################################################################
+        # PATCHED: Save PEFT LoRA weights instead of attn_procs.
+        # OLD:
+        #   unet_phi.save_attn_procs(save_directory=f'{args.work_dir}')
+        # NEW:
+        #   unet_phi.save_pretrained(save_directory=...)
+        ######################################################################
         if args.phi_model in ['lora']:
-            unet_phi.save_attn_procs(save_directory=f'{args.work_dir}')
+            save_dir = f'{args.work_dir}/lora_weights'
+            unet_phi.save_pretrained(save_dir)
+            print(f'LoRA weights saved to {save_dir}')
         elif args.phi_model in ['unet_simple']:
             unet_phi.save_pretrained(save_directory=f'{args.work_dir}')
 
 #########################################################################################
 if __name__ == "__main__":
     main()
-
-
